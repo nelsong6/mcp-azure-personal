@@ -28,6 +28,7 @@ RESOURCES_API_VERSION = "2021-04-01"
 STATIC_SITE_API_VERSION = "2024-04-01"
 RESOURCE_GROUP_API_VERSION = "2024-11-01"
 AKS_API_VERSION = "2024-10-01"
+MANAGED_IDENTITY_API_VERSION = "2023-01-31"
 POLL_TIMEOUT_SECONDS = 600
 DEFAULT_QUERY_LIMIT = 100
 MAX_QUERY_LIMIT = 1000
@@ -245,6 +246,62 @@ def _normalize_redirect_uri(uri: str) -> str:
     if not normalized.startswith("https://") and "localhost" not in normalized:
         raise ValueError(f"redirect URI must be https unless localhost: {uri!r}")
     return normalized
+
+
+def _normalize_fic_name(name: str) -> str:
+    normalized = str(name or "").strip()
+    if not normalized:
+        raise ValueError("federated credential name must not be empty")
+    if len(normalized) > 120:
+        raise ValueError("federated credential name must be at most 120 characters")
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")
+    if any(ch not in allowed for ch in normalized):
+        raise ValueError("federated credential name may only contain letters, numbers, '-', '_', and '.'")
+    return normalized
+
+
+def _normalize_subject(subject: str) -> str:
+    normalized = str(subject or "").strip()
+    if not normalized:
+        raise ValueError("subject must not be empty")
+    if not normalized.startswith("system:serviceaccount:"):
+        raise ValueError("subject must be a Kubernetes service-account subject")
+    parts = normalized.split(":")
+    if len(parts) != 4 or not parts[2] or not parts[3]:
+        raise ValueError("subject must be system:serviceaccount:<namespace>:<serviceaccount>")
+    return normalized
+
+
+def _normalize_audiences(audiences: list[str] | None) -> list[str]:
+    values = audiences or ["api://AzureADTokenExchange"]
+    normalized = []
+    seen = set()
+    for audience in values:
+        value = str(audience or "").strip()
+        if not value:
+            raise ValueError("audience must not be empty")
+        if value not in seen:
+            normalized.append(value)
+            seen.add(value)
+    if "api://AzureADTokenExchange" not in normalized:
+        raise ValueError("audiences must include api://AzureADTokenExchange")
+    return normalized
+
+
+def _uami_fic_path(
+    *,
+    subscription: str | None,
+    resource_group: str,
+    identity_name: str,
+    credential_name: str | None = None,
+) -> str:
+    sub = _subscription(subscription)
+    base = (
+        f"/subscriptions/{sub}/resourceGroups/{resource_group}"
+        f"/providers/Microsoft.ManagedIdentity/userAssignedIdentities/{identity_name}"
+        "/federatedIdentityCredentials"
+    )
+    return f"{base}/{credential_name}" if credential_name else base
 
 
 def _resolve_application(
@@ -481,6 +538,90 @@ def register_tools(mcp: FastMCP) -> None:
             "added_redirect_uris": added,
             "redirect_uris": merged,
             "changed": bool(added),
+        }
+
+    @mcp.tool()
+    def uami_upsert_federated_credential(
+        resource_group: str,
+        identity_name: str,
+        credential_name: str,
+        issuer: str,
+        subject: str,
+        audiences: list[str] | None = None,
+        subscription: str | None = None,
+        dry_run: bool = True,
+    ) -> dict[str, Any]:
+        """Create or update one user-assigned managed identity FIC.
+
+        Use for Kubernetes workload-identity subjects owned by dynamic
+        validation slots. The caller must pass the exact UAMI resource group
+        and name plus the exact Kubernetes service-account subject
+        (`system:serviceaccount:<namespace>:<serviceaccount>`). Existing
+        credentials with the same name are preserved when their issuer,
+        subject, and audiences already match. `dry_run` defaults true; pass
+        false to write.
+        """
+        if not resource_group:
+            raise ValueError("resource_group is required")
+        if not identity_name:
+            raise ValueError("identity_name is required")
+        normalized_name = _normalize_fic_name(credential_name)
+        normalized_subject = _normalize_subject(subject)
+        normalized_issuer = str(issuer or "").strip()
+        if not normalized_issuer.startswith("https://"):
+            raise ValueError("issuer must be an https URL")
+        normalized_audiences = _normalize_audiences(audiences)
+        path = _uami_fic_path(
+            subscription=subscription,
+            resource_group=resource_group,
+            identity_name=identity_name,
+            credential_name=normalized_name,
+        )
+
+        current: dict[str, Any] | None = None
+        resp = requests.get(
+            f"{ARM}{path}?api-version={MANAGED_IDENTITY_API_VERSION}",
+            headers=_headers(),
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            current = resp.json()
+        elif resp.status_code != 404:
+            raise RuntimeError(
+                f"Azure ARM GET {path} failed with {resp.status_code}: {resp.text.strip()}"
+            )
+
+        desired_properties = {
+            "issuer": normalized_issuer,
+            "subject": normalized_subject,
+            "audiences": normalized_audiences,
+        }
+        current_properties = (current or {}).get("properties") or {}
+        changed = (
+            current is None
+            or current_properties.get("issuer") != normalized_issuer
+            or current_properties.get("subject") != normalized_subject
+            or list(current_properties.get("audiences") or []) != normalized_audiences
+        )
+
+        if changed and not dry_run:
+            _request(
+                "PUT",
+                f"{path}?api-version={MANAGED_IDENTITY_API_VERSION}",
+                ok={200, 201},
+                json={"properties": desired_properties},
+            )
+
+        return {
+            "dry_run": dry_run,
+            "subscription": _subscription(subscription),
+            "resource_group": resource_group,
+            "identity_name": identity_name,
+            "credential_name": normalized_name,
+            "resource_id": path,
+            "existing": current_properties if current is not None else None,
+            "desired": desired_properties,
+            "changed": changed,
         }
 
     @mcp.tool()
