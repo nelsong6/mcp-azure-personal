@@ -921,6 +921,66 @@ def register_tools(mcp: FastMCP) -> None:
         return result
 
     @mcp.tool()
+    def cosmos_delete_item(
+        account: str,
+        database: str,
+        container: str,
+        item_id: str,
+        partition_key: Any,
+        etag: str | None = None,
+        match_condition: str | None = None,
+        dry_run: bool = True,
+        account_endpoint: str | None = None,
+    ) -> dict[str, Any]:
+        """Delete one Cosmos DB item by id and partition key.
+
+        Destructive. `dry_run` defaults true and returns the current
+        etag plus the resolved id/partition_key without writing — so
+        callers can inspect what would be deleted before flipping
+        `dry_run=false`. When you have a current etag, pass `etag` and
+        `match_condition="if-match"` for optimistic concurrency.
+        """
+        before = _read_item(
+            account=account,
+            database=database,
+            container=container,
+            item_id=item_id,
+            partition_key=partition_key,
+            account_endpoint=account_endpoint,
+        )
+        if dry_run:
+            return {
+                "dry_run": True,
+                "account": account,
+                "database": database,
+                "container": container,
+                "id": item_id,
+                "partition_key": partition_key,
+                "etag": _etag(before),
+            }
+        proxy = _cosmos_container(
+            account=account,
+            database=database,
+            container=container,
+            account_endpoint=account_endpoint,
+        )
+        proxy.delete_item(
+            item=item_id,
+            partition_key=partition_key,
+            etag=etag,
+            match_condition=_normalize_match_condition(match_condition),
+        )
+        return {
+            "dry_run": False,
+            "deleted": True,
+            "account": account,
+            "database": database,
+            "container": container,
+            "id": item_id,
+            "partition_key": partition_key,
+        }
+
+    @mcp.tool()
     def delete_static_web_app(
         resource_group: str,
         name: str,
