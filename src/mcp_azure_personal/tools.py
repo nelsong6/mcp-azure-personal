@@ -250,6 +250,7 @@ def _normalize_redirect_uri(uri: str) -> str:
 def _resolve_application(
     *,
     application_object_id: str | None = None,
+    application_app_id: str | None = None,
     display_name: str | None = None,
 ) -> dict[str, Any]:
     if application_object_id:
@@ -258,8 +259,14 @@ def _resolve_application(
             f"/applications/{application_object_id}",
             ok={200},
         ).json()
+    if application_app_id:
+        return _graph_request(
+            "GET",
+            f"/applications(appId='{_graph_filter_literal(application_app_id)}')",
+            ok={200},
+        ).json()
     if not display_name:
-        raise ValueError("application_object_id or display_name is required")
+        raise ValueError("application_object_id, application_app_id, or display_name is required")
     payload = _graph_request(
         "GET",
         "/applications"
@@ -416,14 +423,18 @@ def register_tools(mcp: FastMCP) -> None:
     def entra_upsert_spa_redirect_uris(
         redirect_uris: list[str],
         application_object_id: str | None = None,
+        application_app_id: str | None = None,
         display_name: str | None = None,
         dry_run: bool = True,
     ) -> dict[str, Any]:
         """Add SPA redirect URIs to one Entra app registration.
 
         Resolve the app by exact `application_object_id` or exact
-        `display_name`. The tool preserves existing SPA redirect URIs and only
-        appends missing values. `dry_run` defaults true; pass false to write.
+        `application_app_id` (client id), or exact `display_name`. Prefer
+        `application_app_id` or `application_object_id`; display-name lookup
+        may need broader directory read permission. The tool preserves existing
+        SPA redirect URIs and only appends missing values. `dry_run` defaults
+        true; pass false to write.
 
         Use for native webapp validation hosts whose browser login uses
         MSAL.js with `redirectUri = window.location.origin + "/"`.
@@ -440,6 +451,7 @@ def register_tools(mcp: FastMCP) -> None:
 
         app = _resolve_application(
             application_object_id=application_object_id,
+            application_app_id=application_app_id,
             display_name=display_name,
         )
         app_id = str(app.get("id") or "")
