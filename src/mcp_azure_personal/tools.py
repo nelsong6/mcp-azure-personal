@@ -31,6 +31,7 @@ STATIC_SITE_API_VERSION = "2024-04-01"
 RESOURCE_GROUP_API_VERSION = "2024-11-01"
 AKS_API_VERSION = "2024-10-01"
 MANAGED_IDENTITY_API_VERSION = "2023-01-31"
+COST_MANAGEMENT_API_VERSION = "2023-11-01"
 POLL_TIMEOUT_SECONDS = 600
 DEFAULT_QUERY_LIMIT = 100
 MAX_QUERY_LIMIT = 1000
@@ -418,6 +419,71 @@ def _operation_url(resp: requests.Response) -> str | None:
     return resp.headers.get("Azure-AsyncOperation") or resp.headers.get("Location")
 
 
+def _cost_query_body(
+    *,
+    timeframe: str,
+    from_date: str | None,
+    to_date: str | None,
+    metric: str,
+    granularity: str,
+    group_by: list[str] | None,
+    filter: dict[str, Any] | None,
+) -> dict[str, Any]:
+    normalized_timeframe = str(timeframe or "").strip()
+    if not normalized_timeframe:
+        raise ValueError("timeframe is required")
+    if normalized_timeframe == "Custom" and (not from_date or not to_date):
+        raise ValueError("from_date and to_date are required when timeframe is Custom")
+    if normalized_timeframe != "Custom" and (from_date or to_date):
+        raise ValueError("from_date and to_date may only be set when timeframe is Custom")
+
+    normalized_metric = str(metric or "").strip()
+    if normalized_metric not in {"ActualCost", "AmortizedCost"}:
+        raise ValueError("metric must be ActualCost or AmortizedCost")
+
+    normalized_granularity = str(granularity or "").strip()
+    if normalized_granularity not in {"None", "Daily", "Monthly"}:
+        raise ValueError("granularity must be None, Daily, or Monthly")
+
+    grouping = []
+    for name in group_by or []:
+        value = str(name or "").strip()
+        if not value:
+            raise ValueError("group_by values must not be empty")
+        grouping.append({"type": "Dimension", "name": value})
+
+    body: dict[str, Any] = {
+        "type": normalized_metric,
+        "timeframe": normalized_timeframe,
+        "dataset": {
+            "granularity": normalized_granularity,
+            "aggregation": {
+                "totalCost": {
+                    "name": "PreTaxCost",
+                    "function": "Sum",
+                }
+            },
+        },
+    }
+    if grouping:
+        body["dataset"]["grouping"] = grouping
+    if filter:
+        body["dataset"]["filter"] = filter
+    if normalized_timeframe == "Custom":
+        body["timePeriod"] = {"from": from_date, "to": to_date}
+    return body
+
+
+def _tabular_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    properties = payload.get("properties") if isinstance(payload.get("properties"), dict) else {}
+    columns = properties.get("columns") or []
+    rows = properties.get("rows") or []
+    names = [str(column.get("name")) for column in columns if isinstance(column, dict)]
+    if not names:
+        return []
+    return [dict(zip(names, row, strict=False)) for row in rows if isinstance(row, list)]
+
+
 def _run_command_logs(payload: dict[str, Any]) -> str:
     properties = payload.get("properties") if isinstance(payload.get("properties"), dict) else {}
     for key in ("logs", "output", "result"):
@@ -516,6 +582,49 @@ def register_tools(mcp: FastMCP) -> None:
             "path": resolved,
             "api_version": api_version,
             "resource": payload,
+        }
+
+    @mcp.tool()
+    def cost_management_query_subscription(
+        timeframe: str = "MonthToDate",
+        from_date: str | None = None,
+        to_date: str | None = None,
+        metric: str = "ActualCost",
+        granularity: str = "Daily",
+        group_by: list[str] | None = None,
+        filter: dict[str, Any] | None = None,
+        subscription: str | None = None,
+    ) -> dict[str, Any]:
+        """Query Azure Cost Management data for a subscription.
+
+        Use for Cost Analysis views such as month-to-date actual spend grouped
+        by dimensions like ServiceName, ResourceGroupName, ResourceId,
+        MeterCategory, ChargeType, or PublisherType. For explicit date ranges,
+        set timeframe="Custom" and pass ISO-8601 from_date and to_date values.
+        `filter` is passed through to Cost Management's dataset filter shape.
+        """
+        sub = _subscription(subscription)
+        body = _cost_query_body(
+            timeframe=timeframe,
+            from_date=from_date,
+            to_date=to_date,
+            metric=metric,
+            granularity=granularity,
+            group_by=group_by,
+            filter=filter,
+        )
+        path = (
+            f"/subscriptions/{sub}/providers/Microsoft.CostManagement/query"
+            f"?api-version={COST_MANAGEMENT_API_VERSION}"
+        )
+        payload = _request("POST", path, ok={200, 201}, json=body).json()
+        return {
+            "subscription": sub,
+            "api_version": COST_MANAGEMENT_API_VERSION,
+            "query": body,
+            "columns": payload.get("properties", {}).get("columns") or [],
+            "rows": _tabular_rows(payload),
+            "raw": payload,
         }
 
     @mcp.tool()
