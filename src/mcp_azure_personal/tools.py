@@ -692,6 +692,65 @@ def register_tools(mcp: FastMCP) -> None:
         }
 
     @mcp.tool()
+    def entra_replace_spa_redirect_uris(
+        redirect_uris: list[str],
+        application_object_id: str | None = None,
+        application_app_id: str | None = None,
+        display_name: str | None = None,
+        dry_run: bool = True,
+    ) -> dict[str, Any]:
+        """Replace the SPA redirect URI list on one Entra app registration.
+
+        Resolve the app by exact `application_object_id`, exact
+        `application_app_id` (client id), or exact `display_name`. Prefer
+        `application_app_id` or `application_object_id`.
+
+        This is the destructive counterpart to
+        `entra_upsert_spa_redirect_uris`: existing SPA redirect URIs not in
+        `redirect_uris` are removed. Pass an empty list to clear the SPA
+        redirect URI set. `dry_run` defaults true; pass false to write.
+        """
+        wanted = []
+        seen = set()
+        for uri in redirect_uris:
+            normalized = _normalize_redirect_uri(uri)
+            if normalized not in seen:
+                wanted.append(normalized)
+                seen.add(normalized)
+
+        app = _resolve_application(
+            application_object_id=application_object_id,
+            application_app_id=application_app_id,
+            display_name=display_name,
+        )
+        app_id = str(app.get("id") or "")
+        current = list(((app.get("spa") or {}).get("redirectUris")) or [])
+        removed = [uri for uri in current if uri not in wanted]
+        added = [uri for uri in wanted if uri not in current]
+        changed = bool(removed or added)
+
+        if not dry_run and changed:
+            _graph_request(
+                "PATCH",
+                f"/applications/{app_id}",
+                ok={204},
+                json={"spa": {"redirectUris": wanted}},
+            )
+
+        return {
+            "dry_run": dry_run,
+            "application_object_id": app_id,
+            "app_id": app.get("appId"),
+            "display_name": app.get("displayName"),
+            "existing_redirect_uris": current,
+            "requested_redirect_uris": wanted,
+            "added_redirect_uris": added,
+            "removed_redirect_uris": removed,
+            "redirect_uris": wanted,
+            "changed": changed,
+        }
+
+    @mcp.tool()
     def uami_upsert_federated_credential(
         resource_group: str,
         identity_name: str,
