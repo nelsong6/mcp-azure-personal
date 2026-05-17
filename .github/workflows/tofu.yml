@@ -39,10 +39,4 @@ jobs:
       backend_container: tfstate
       backend_key: mcp-azure-personal.tfstate
       tofu_version: '1.12.0'
-      # infra/providers.tf reads var.arm_subscription_id / var.arm_tenant_id.
-      # The shared template exports ARM_* env vars for OIDC auth but does
-      # NOT set TF_VAR_*, so pass them through here.
-      tofu_vars: >-
-        -var=arm_subscription_id=${{ vars.ARM_SUBSCRIPTION_ID }}
-        -var=arm_tenant_id=${{ vars.ARM_TENANT_ID }}
     secrets: inherit

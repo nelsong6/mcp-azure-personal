@@ -1,13 +1,3 @@
-variable "arm_subscription_id" {
-  description = "Azure subscription ID. Set via TF_VAR_arm_subscription_id from the workflow."
-  type        = string
-}
-
-variable "arm_tenant_id" {
-  description = "Entra tenant ID. Set via TF_VAR_arm_tenant_id from the workflow."
-  type        = string
-}
-
 variable "key_vault_name" {
   description = "Key Vault that receives the UAMI client ID secret for ESO sync."
   type        = string
