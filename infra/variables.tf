@@ -33,3 +33,9 @@ variable "tank_aks_cluster_id" {
   type        = string
   default     = "/subscriptions/606a1ca1-5833-4d21-8937-d0fcd97cd0a0/resourceGroups/infra/providers/Microsoft.ContainerService/managedClusters/infra-aks"
 }
+
+variable "cluster_subscription_id" {
+  description = "Azure subscription ID of the AKS cluster. Used to configure the azurerm.cluster provider alias for cross-sub role assignments on cluster-sub resources (Reader, Cost Management Reader for the UAMI). Matches the value infra-bootstrap publishes as CLUSTER_SUBSCRIPTION_ID on this repo and the cluster's sub in tank_aks_cluster_id above."
+  type        = string
+  default     = "606a1ca1-5833-4d21-8937-d0fcd97cd0a0"
+}

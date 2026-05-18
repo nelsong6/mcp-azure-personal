@@ -86,6 +86,49 @@ resource "azurerm_role_assignment" "tank_aks_runcommand" {
 }
 
 # ----------------------------------------------------------------------------
+# UAMI Cost Management Reader on workload sub; Reader + Cost Management
+# Reader on cluster sub
+# ----------------------------------------------------------------------------
+# Cost Management Reader powers the Cost Analysis tool's
+# Microsoft.CostManagement / Microsoft.Consumption actions — not included
+# in Contributor (or Reader) at any scope, so it needs an explicit grant
+# on both subs.
+#
+# Cluster sub also needs plain Reader because Contributor is workload-sub-
+# scoped (see the role_assignments map above) and doesn't reach
+# cluster-sub resources; the MCP's broad troubleshooting tools
+# (arm_list_resources, arm_get_resource) would 403 on every cluster-sub
+# query otherwise. Workload-sub Reader isn't needed — the existing
+# subscription-Contributor grant already covers reads there.
+#
+# Migrated from nelsong6/infra-bootstrap/tofu/mcp-azure-personal.tf, which
+# was deleted in infra-bootstrap#127 because its `data.azuread_service_
+# principal` pinned a tombstoned UAMI client_id from a previous destroy-
+# recreate cycle. App-specific grants belong here, not in infra-bootstrap;
+# this version references the live UAMI via the module output so any
+# future destroy-recreate within this stack auto-updates the principal_id.
+
+resource "azurerm_role_assignment" "uami_workload_sub_cost_management_reader" {
+  scope                = "/subscriptions/${data.azurerm_client_config.current.subscription_id}"
+  role_definition_name = "Cost Management Reader"
+  principal_id         = module.mcp_azure_personal.managed_identity_principal_id
+}
+
+resource "azurerm_role_assignment" "uami_cluster_sub_reader" {
+  provider             = azurerm.cluster
+  scope                = "/subscriptions/${var.cluster_subscription_id}"
+  role_definition_name = "Reader"
+  principal_id         = module.mcp_azure_personal.managed_identity_principal_id
+}
+
+resource "azurerm_role_assignment" "uami_cluster_sub_cost_management_reader" {
+  provider             = azurerm.cluster
+  scope                = "/subscriptions/${var.cluster_subscription_id}"
+  role_definition_name = "Cost Management Reader"
+  principal_id         = module.mcp_azure_personal.managed_identity_principal_id
+}
+
+# ----------------------------------------------------------------------------
 # Postgres data-plane access (pg_query)
 # ----------------------------------------------------------------------------
 # Registers this MCP's UAMI as an Entra AD admin on the tank-operator Postgres
