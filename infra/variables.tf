@@ -27,3 +27,9 @@ variable "tank_operator_postgres_resource_group" {
   type        = string
   default     = "infra"
 }
+
+variable "tank_aks_cluster_id" {
+  description = "Full ARM ID of the AKS cluster the run_aks_command tool targets. This cluster lives in a different subscription from the rest of this stack, so it can't be derived from data.azurerm_client_config.current — the scope has to be passed in explicitly."
+  type        = string
+  default     = "/subscriptions/606a1ca1-5833-4d21-8937-d0fcd97cd0a0/resourceGroups/infra/providers/Microsoft.ContainerService/managedClusters/infra-aks"
+}

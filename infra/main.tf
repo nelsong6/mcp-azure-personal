@@ -63,6 +63,29 @@ resource "azurerm_cosmosdb_sql_role_assignment" "infra_serverless_contributor" {
 }
 
 # ----------------------------------------------------------------------------
+# tank-operator AKS runCommand access (run_aks_command tool)
+# ----------------------------------------------------------------------------
+# Cross-subscription grant. This UAMI lives in the workload subscription
+# alongside the rest of the platform; the AKS cluster lives in a separate
+# subscription ("romaine-life") and the "subscription-operator" Contributor
+# above is scoped to data.azurerm_client_config.current.subscription_id, so
+# it never reaches the cluster — hence the explicit scope here.
+#
+# Azure Kubernetes Service Contributor Role covers the two ARM actions
+# run_aks_command needs:
+#   Microsoft.ContainerService/managedClusters/runCommand/action
+#   Microsoft.ContainerService/managedClusters/commandResults/read
+#
+# infra-aks has disableLocalAccounts=false and aadProfile=null, so
+# runCommand falls through to the local admin kubeconfig path — no
+# Kubernetes-side AAD role binding required beyond this ARM grant.
+resource "azurerm_role_assignment" "tank_aks_runcommand" {
+  scope                = var.tank_aks_cluster_id
+  role_definition_name = "Azure Kubernetes Service Contributor Role"
+  principal_id         = module.mcp_azure_personal.managed_identity_principal_id
+}
+
+# ----------------------------------------------------------------------------
 # Postgres data-plane access (pg_query)
 # ----------------------------------------------------------------------------
 # Registers this MCP's UAMI as an Entra AD admin on the tank-operator Postgres
