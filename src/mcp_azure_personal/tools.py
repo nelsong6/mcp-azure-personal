@@ -25,6 +25,9 @@ ARM_SCOPE = "https://management.azure.com/.default"
 GRAPH = "https://graph.microsoft.com/v1.0"
 GRAPH_SCOPE = "https://graph.microsoft.com/.default"
 KEYVAULT_SCOPE = "https://vault.azure.net/.default"
+# Azure Database for PostgreSQL — Flexible Server's Entra auth scope. Single
+# value across clouds; the Entra token is presented as the libpq password.
+PG_OSS_SCOPE = "https://ossrdbms-aad.database.windows.net/.default"
 KEYVAULT_API_VERSION = "7.4"
 RESOURCES_API_VERSION = "2021-04-01"
 STATIC_SITE_API_VERSION = "2024-04-01"
@@ -36,6 +39,11 @@ POLL_TIMEOUT_SECONDS = 600
 DEFAULT_QUERY_LIMIT = 100
 MAX_QUERY_LIMIT = 1000
 MAX_COSMOS_RESPONSE_ITEMS = 1000
+DEFAULT_PG_ROW_LIMIT = 100
+MAX_PG_ROW_LIMIT = 1000
+DEFAULT_PG_STATEMENT_TIMEOUT_MS = 10_000
+MAX_PG_STATEMENT_TIMEOUT_MS = 60_000
+DEFAULT_PG_CONNECT_TIMEOUT_SECONDS = 10
 
 
 def _subscription(subscription: str | None) -> str:
@@ -130,6 +138,24 @@ def _jsonable_doc(doc: Any) -> Any:
     if isinstance(doc, list):
         return [_jsonable_doc(v) for v in doc]
     return doc
+
+
+def _jsonable_pg_value(value: Any) -> Any:
+    """Coerce a psycopg cell value into something the MCP transport can
+    JSON-encode. psycopg already maps Postgres `jsonb` to dict/list and
+    numeric scalars to Python ints/floats; the catch-all `str(value)` fallback
+    handles datetimes, dates, UUIDs, intervals, Decimals, IP addresses, and
+    Postgres ranges. `bytea` is rendered as hex so the response stays text.
+    """
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_jsonable_pg_value(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _jsonable_pg_value(v) for k, v in value.items()}
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value).hex()
+    return str(value)
 
 
 def _etag(doc: dict[str, Any]) -> str | None:
@@ -1490,3 +1516,117 @@ def register_tools(mcp: FastMCP) -> None:
         plan["new_content_type"] = resp.get("contentType")
         plan["new_tags"] = resp.get("tags") or {}
         return plan
+
+    @mcp.tool()
+    def pg_query(
+        host: str,
+        database: str,
+        user: str,
+        sql: str,
+        parameters: list[Any] | None = None,
+        limit: int = DEFAULT_PG_ROW_LIMIT,
+        statement_timeout_ms: int = DEFAULT_PG_STATEMENT_TIMEOUT_MS,
+        port: int = 5432,
+    ) -> dict[str, Any]:
+        """Run one read-only SQL query against an Azure Database for PostgreSQL
+        Flexible Server, authenticating as this MCP's UAMI via Entra (AAD).
+
+        For tank-operator's session registry the call is
+        `host="tank-operator-db.postgres.database.azure.com"`,
+        `database="tank-operator"`, `user="mcp-azure-personal-identity"` —
+        the UAMI is registered as an AAD admin on that server in this repo's
+        infra/.
+
+        The connection is opened with `default_transaction_read_only=on`, so
+        writes — including via functions — fail with
+        `cannot execute ... in a read-only transaction`. `parameters` is a
+        positional list bound to `%s` placeholders in `sql` (libpq has no
+        Cosmos-style named-parameter binding). `statement_timeout_ms` is
+        enforced server-side per session via SET. Returns up to `limit` rows
+        plus a `truncated` flag.
+        """
+        # Local import — psycopg pulls in libpq via the [binary] extra, but
+        # only the pg_query path ever needs it. Other tools still load fine
+        # if a future build forgets the extra.
+        import psycopg
+        from psycopg.rows import dict_row
+
+        if not host:
+            raise ValueError("host is required")
+        if not database:
+            raise ValueError("database is required")
+        if not user:
+            raise ValueError("user is required")
+        if not sql or not sql.strip():
+            raise ValueError("sql is required")
+        if limit < 1 or limit > MAX_PG_ROW_LIMIT:
+            raise ValueError(f"limit must be between 1 and {MAX_PG_ROW_LIMIT}")
+        if (
+            statement_timeout_ms < 100
+            or statement_timeout_ms > MAX_PG_STATEMENT_TIMEOUT_MS
+        ):
+            raise ValueError(
+                f"statement_timeout_ms must be between 100 and {MAX_PG_STATEMENT_TIMEOUT_MS}"
+            )
+        if port < 1 or port > 65535:
+            raise ValueError("port must be between 1 and 65535")
+
+        token = _credential().get_token(PG_OSS_SCOPE).token
+
+        # Cap rows with a fetchmany(limit + 1) probe: if Postgres returned an
+        # extra row beyond `limit`, we know more matched and can report
+        # truncated=True without spending an extra round-trip on COUNT(*).
+        bound_params: tuple[Any, ...] = tuple(parameters or ())
+        truncated = False
+        columns: list[str] = []
+        rows: list[dict[str, Any]] = []
+        row_count: int | None = None
+
+        with psycopg.connect(
+            host=host,
+            port=port,
+            dbname=database,
+            user=user,
+            password=token,
+            sslmode="require",
+            connect_timeout=DEFAULT_PG_CONNECT_TIMEOUT_SECONDS,
+            # Server-side read-only + statement timeout. Belt-and-suspenders:
+            # the read-only default also catches writes hidden inside CTEs or
+            # SQL functions that we couldn't filter by inspecting `sql`.
+            options=(
+                "-c default_transaction_read_only=on "
+                f"-c statement_timeout={int(statement_timeout_ms)}"
+            ),
+        ) as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(sql, bound_params)
+                if cur.description is not None:
+                    columns = [str(d.name) for d in cur.description]
+                    fetched = cur.fetchmany(limit + 1)
+                    if len(fetched) > limit:
+                        truncated = True
+                        fetched = fetched[:limit]
+                    rows = [
+                        {k: _jsonable_pg_value(v) for k, v in row.items()}
+                        for row in fetched
+                    ]
+                else:
+                    # Non-SELECT statements (e.g. SET, EXPLAIN ... ) can land
+                    # here. Read-only enforcement happens server-side, so we
+                    # only need to surface that there were no result rows.
+                    row_count = cur.rowcount if cur.rowcount >= 0 else None
+            # Explicit rollback — defensive against drivers that opened an
+            # implicit transaction we didn't see. The context manager would
+            # commit on a clean exit otherwise.
+            conn.rollback()
+
+        return {
+            "host": host,
+            "port": port,
+            "database": database,
+            "user": user,
+            "columns": columns,
+            "row_count": row_count if row_count is not None else len(rows),
+            "rows": rows,
+            "truncated": truncated,
+        }
